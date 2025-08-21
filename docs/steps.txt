@@ -1,0 +1,39 @@
+python -m venv conversational_ai_env
+conversational_ai_env\Scripts\activat
+
+pip install -r requirements.txt
+pip install transformers[torch] -U
+ 
+###rag###
+run_cli.bat ingest
+run_cli.bat build
+
+run_cli.bat chat
+or
+run_cli.bat chat --model_size medium
+
+###finetune###
+
+run_cli.bat finetune
+
+run_cli.bat chat --mode fine-tuning
+
+### benchmark ####
+
+run_cli.bat benchmark
+
+
+### chat ###
+run_cli.bat chat --model_size medium
+
+
+uvicorn src.web.app:app --reload
+
+http://127.0.0.1:8000/
+
+
+What was the company's revenue in 2023?
+
+What was the net income in 2024?
+
+What were Microsoft’s total assets and liabilities in 2023?

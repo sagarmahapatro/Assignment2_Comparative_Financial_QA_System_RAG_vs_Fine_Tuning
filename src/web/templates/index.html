@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Financial QA AI Chatbot</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 30px; }
+    textarea { width: 100%; height: 100px; margin-bottom: 15px; padding: 10px; font-size: 14px; }
+    select, button { padding: 8px 12px; font-size: 14px; margin-right: 10px; }
+    #response { height: 120px; background: #f9f9f9; }
+    .error { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h2>📊 Financial QA AI Chatbot</h2>
+
+  <label for="query">Enter your question:</label><br>
+  <textarea id="query" placeholder="e.g., What was the Microsoft's revenue in 2023?"></textarea><br>
+
+  <label for="mode">Select mode:</label>
+  <select id="mode">
+    <option value="rag">RAG</option>
+    <option value="finetune">Fine-tuned GPT-2</option>
+  </select>
+
+  <button onclick="sendQuery()">Submit</button>
+
+  <h3>Response:</h3>
+  <textarea id="response" readonly></textarea>
+  <div id="error" class="error"></div>
+
+  <script>
+    async function sendQuery() {
+      query = document.getElementById("query").value;
+      const mode = document.getElementById("mode").value;
+
+      if (!query.trim()) {
+        //document.getElementById("error").textContent = "⚠️ Please enter a question.";
+        query = "What was the Microsoft's revenue in 2023?";
+      }
+
+      document.getElementById("response").value = "";   // clear old output
+      document.getElementById("error").textContent = ""; // clear old error
+
+      try {
+        const res = await fetch("http://127.0.0.1:8000/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: query, mode: mode })
+        });
+
+        const data = await res.json();
+        console.log(data.response.success);
+        console.dir(data);
+        if (!data.response.success) {
+          document.getElementById("error").textContent = "⚠️ Error: " + (data.response.error || "Unknown error");
+        } else {
+          document.getElementById("response").value = data.response.answer || "No answer provided";
+        }
+      } catch (err) {
+        document.getElementById("error").textContent = "⚠️ Request failed: " + err.message;
+      }
+    }
+  </script>
+</body>
+</html>

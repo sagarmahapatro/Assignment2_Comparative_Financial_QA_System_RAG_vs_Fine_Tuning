@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""
+RAG Financial QA – CLI Implementation
+------------------------------------
+
+Features
+- Ingest last-two-year company financial reports (PDF/HTML/Excel/TXT)
+- Clean & chunk (two chunk sizes: 100, 400 GPT‑2 tokens) with metadata
+- Embeddings: sentence-transformers (all-MiniLM-L6-v2 by default)
+- Dense index: FAISS (IndexFlatIP on L2-normalized vectors)
+- Sparse index: BM25 (rank_bm25)
+- Hybrid retrieval with weighted score fusion
+- Advanced RAG: Memory-Augmented Retrieval from persistent Q&A memory.jsonl
+- Generator: GPT‑2 small (transformers) with prompt template & context window cap
+- Guardrails: input validation + output groundedness check (answer↔context similarity)
+- CLI interface: build index, chat, show confidence, retrieval method, response time
+
+Usage
+------
+1) Install deps (see requirements at the bottom of this file)
+2) Prepare your data directory, e.g. ./data with PDFs/HTML/XLSX/TXT
+3) Build index:
+   python rag_cli.py build --data_dir ./data --index_dir ./index
+
+4) Chat:
+   python rag_cli.py chat --index_dir ./index
+
+Optional flags:
+   --alpha 0.6                 # weight for dense vs sparse in fusion
+   --top_k 6                   # candidates from each retriever
+   --max_ctx_tokens 900        # budget for retrieved context passed to GPT-2
+   --memory_file ./memory.jsonl  # persistent Q&A memory bank
+
+Memory file format (JSONL): one object per line with fields {"question": str, "answer": str}.
+50+ Q/A pairs recommended.
+
+This single file includes everything for simplicity. You can split into modules later.
+"""
+
+import os
+import re
+import io
+import gc
+import json
+import time
+import math
+import glob
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
+# ---------------------- Utilities ----------------------
+
+def strip_controls(text: str) -> str:
+    # basic cleanup: normalize spaces & remove control chars
+    text = re.sub(r"[\u0000-\u001F\u007F]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+# ---------------------- Document Loaders ----------------------
+
+def read_txt(path: Path) -> str:
+    return strip_controls(path.read_text(encoding="utf-8", errors="ignore"))
+
+
+def read_pdf(path: Path) -> str:
+    """Prefer PyMuPDF for robust PDF text extraction."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        raise RuntimeError("PyMuPDF (fitz) is required for PDF parsing. pip install pymupdf")
+
+    text_parts = []
+    with fitz.open(str(path)) as doc:
+        for page in doc:
+            text_parts.append(page.get_text("text"))
+    return strip_controls("\n".join(text_parts))
+
+
+def read_html(path: Path) -> str:
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        raise RuntimeError("bs4 is required for HTML parsing. pip install beautifulsoup4 lxml")
+
+    html = path.read_text(encoding="utf-8", errors="ignore")
+    soup = BeautifulSoup(html, "lxml")
+    # remove scripts/styles
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(" ")
+    return strip_controls(text)
+
+
+def read_excel(path: Path) -> str:
+    import pandas as pd
+    xl = pd.ExcelFile(path)
+    parts = []
+    for sheet in xl.sheet_names:
+        df = xl.parse(sheet)
+        # Convert to pipe table text (keeps structure minimal)
+        parts.append(f"# Sheet: {sheet}\n")
+        parts.append(df.to_csv(index=False))
+    return strip_controls("\n".join(parts))
+
+
+def load_documents(data_dir: Path) -> List[Dict[str, Any]]:
+    """Load supported files and return list of {id, text, meta}.
+    meta includes source_path and file_type.
+    """
+    docs = []
+    patterns = ["**/*.pdf", "**/*.PDF", "**/*.html", "**/*.htm", "**/*.xlsx", "**/*.xls", "**/*.txt", "**/*.md"]
+    files = []
+    for pat in patterns:
+        files.extend(data_dir.glob(pat))
+
+    fid = 0
+    for f in files:
+        try:
+            if f.suffix.lower() == ".pdf":
+                text = read_pdf(f)
+            elif f.suffix.lower() in (".html", ".htm"):
+                text = read_html(f)
+            elif f.suffix.lower() in (".xlsx", ".xls"):
+                text = read_excel(f)
+            else:
+                text = read_txt(f)
+        except Exception as e:
+            print(f"[WARN] Failed to read {f}: {e}")
+            continue
+
+        if not text:
+            continue
+        docs.append({
+            "id": f"doc-{fid}",
+            "text": text,
+            "meta": {"source_path": str(f), "file_type": f.suffix.lower()}
+        })
+        fid += 1
+    return docs
+
+# ---------------------- Cleaning & Segmentation ----------------------
+
+def remove_report_noise(text: str) -> str:
+    # remove common header/footer noise patterns and page numbers
+    text = re.sub(r"\n?Page\s+\d+\s+of\s+\d+\n?", " ", text, flags=re.I)
+    text = re.sub(r"\n?\f\n?", " ", text)  # page breaks
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def naive_sections(text: str) -> List[Tuple[str, str]]:
+    """Very simple heuristic to tag sections based on common report headings."""
+    headings = [
+        (r"income\s+statement|statement\s+of\s+operations", "income_statement"),
+        (r"balance\s+sheet|statement\s+of\s+financial\s+position", "balance_sheet"),
+        (r"cash\s+flows?", "cash_flow"),
+        (r"management'?s?\s+discussion|MD&A", "mda"),
+        (r"notes\s+to\s+the\s+financial\s+statements", "notes"),
+    ]
+    # fallback single section
+    sections = [("full_report", text)]
+    lowered = text.lower()
+    # try splitting by headings
+    found = []
+    for pat, tag in headings:
+        for m in re.finditer(pat, lowered, flags=re.I):
+            found.append((m.start(), tag))
+    if not found:
+        return sections
+    found.sort()
+    # Build segments between heading positions
+    spans = []
+    for i, (pos, tag) in enumerate(found):
+        start = pos
+        end = found[i + 1][0] if i + 1 < len(found) else len(text)
+        seg = text[start:end]
+        spans.append((tag, seg))
+    return spans if spans else sections
+
+# ---------------------- Tokenization & Chunking ----------------------
+
+def get_gpt2_tokenizer():
+    from transformers import AutoTokenizer
+    # gpt2 tokenizer (no pad by default)
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+
+def chunk_text(text: str, tokenizer, chunk_tokens: int = 400, overlap: int = 40) -> List[str]:
+    # chunk by GPT-2 tokens with overlap
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    chunks = []
+    i = 0
+    while i < len(ids):
+        window = ids[i:i + chunk_tokens]
+        if not window:
+            break
+        chunk = tokenizer.decode(window)
+        chunks.append(chunk)
+        i += chunk_tokens - overlap
+        if i <= 0:  # safety
+            i += chunk_tokens
+    return chunks
+
+# ---------------------- Embeddings & Indexing ----------------------
+
+@dataclass
+class Chunk:
+    uid: str
+    doc_id: str
+    section: str
+    chunk_size: int
+    position: int
+    text: str
+
+
+class Indexes:
+    def __init__(self, index_dir: Path, embed_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.index_dir = index_dir
+        self.embed_model_name = embed_model_name
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.encoder = None
+        self.tok = None
+        self.faiss = None
+        self.bm25 = None
+        self.chunks: List[Chunk] = []
+        self.embeddings = None  # 2D list
+
+    # ---------- Persistence ----------
+    def _paths(self):
+        return {
+            "chunks": self.index_dir / "chunks.jsonl",
+            "embeddings": self.index_dir / "embeddings.npy",
+            "faiss": self.index_dir / "faiss.index",
+            "bm25": self.index_dir / "bm25.json",
+            "meta": self.index_dir / "meta.json",
+        }
+
+    def save(self):
+        import numpy as np
+        p = self._paths()
+        with p["chunks"].open("w", encoding="utf-8") as f:
+            for ch in self.chunks:
+                f.write(json.dumps(ch.__dict__, ensure_ascii=False) + "\n")
+        if self.embeddings is not None:
+            np.save(p["embeddings"], self.embeddings)
+        if self.faiss is not None:
+            import faiss
+            faiss.write_index(self.faiss, str(p["faiss"]))
+        # store BM25 corpus + tokenized
+        if self.bm25 is not None:
+            bm = {
+                "corpus": self._bm25_corpus,
+                "uids": [c.uid for c in self.chunks],
+            }
+            p["bm25"].write_text(json.dumps(bm), encoding="utf-8")
+        p["meta"].write_text(json.dumps({"embed_model": self.embed_model_name}), encoding="utf-8")
+
+    def load(self):
+        import numpy as np
+        p = self._paths()
+        if not p["chunks"].exists():
+            raise FileNotFoundError("No chunks.jsonl in index_dir; build first.")
+        self.chunks = []
+        with p["chunks"].open("r", encoding="utf-8") as f:
+            for line in f:
+                self.chunks.append(Chunk(**json.loads(line)))
+        self.embeddings = None
+        if p["embeddings"].exists():
+            self.embeddings = np.load(p["embeddings"])
+        self.faiss = None
+        if p["faiss"].exists():
+            import faiss
+            self.faiss = faiss.read_index(str(p["faiss"]))
+        self.bm25 = None
+        if p["bm25"].exists():
+            bm = json.loads(p["bm25"].read_text(encoding="utf-8"))
+            from rank_bm25 import BM25Okapi
+            self._bm25_corpus = bm["corpus"]
+            self._bm25_uids = bm["uids"]
+            self.bm25 = BM25Okapi([doc.split() for doc in self._bm25_corpus])
+        meta = json.loads(p["meta"].read_text(encoding="utf-8"))
+        self.embed_model_name = meta.get("embed_model", self.embed_model_name)
+
+    # ---------- Builders ----------
+    def _ensure_encoder(self):
+        if self.encoder is None:
+            from sentence_transformers import SentenceTransformer
+            self.encoder = SentenceTransformer(self.embed_model_name)
+        if self.tok is None:
+            self.tok = get_gpt2_tokenizer()
+
+    def build_from_texts(self, docs: List[Dict[str, Any]], chunk_sizes=(100, 400), overlap=20):
+        self._ensure_encoder()
+        chunks: List[Chunk] = []
+        uid_counter = 0
+        for d in docs:
+            text_clean = remove_report_noise(d["text"])
+            for section_tag, section_text in naive_sections(text_clean):
+                for cs in chunk_sizes:
+                    parts = chunk_text(section_text, self.tok, chunk_tokens=cs, overlap=overlap)
+                    for pos, part in enumerate(parts):
+                        chunks.append(Chunk(
+                            uid=f"c{uid_counter}",
+                            doc_id=d["id"],
+                            section=section_tag,
+                            chunk_size=cs,
+                            position=pos,
+                            text=part
+                        ))
+                        uid_counter += 1
+        self.chunks = chunks
+        # Embeddings
+        texts = [c.text for c in self.chunks]
+        import numpy as np
+        embs = self.encoder.encode(texts, batch_size=64, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=True)
+        self.embeddings = embs.astype("float32")
+        # FAISS index (cosine via IP on normalized vectors)
+        import faiss
+        d = self.embeddings.shape[1]
+        idx = faiss.IndexFlatIP(d)
+        idx.add(self.embeddings)
+        self.faiss = idx
+        # BM25
+        from rank_bm25 import BM25Okapi
+        self._bm25_corpus = [simple_preprocess(c.text) for c in self.chunks]
+        self._bm25_uids = [c.uid for c in self.chunks]
+        self.bm25 = BM25Okapi([doc.split() for doc in self._bm25_corpus])
+
+    # ---------- Retrieval ----------
+    def dense_search(self, query: str, top_k=6) -> List[Tuple[str, float]]:
+        assert self.faiss is not None and self.embeddings is not None
+        import numpy as np
+        q = self.encoder.encode([query], convert_to_numpy=True, normalize_embeddings=True)
+        D, I = self.faiss.search(q.astype("float32"), top_k)
+        res = []
+        for score, idx in zip(D[0].tolist(), I[0].tolist()):
+            if idx < 0:
+                continue
+            res.append((self.chunks[idx].uid, float(score)))  # cosine similarity in [-1,1]
+        return res
+
+    def sparse_search(self, query: str, top_k=6) -> List[Tuple[str, float]]:
+        assert self.bm25 is not None
+        q = simple_preprocess(query).split()
+        scores = self.bm25.get_scores(q)
+        # top indices
+        top = sorted(((i, s) for i, s in enumerate(scores)), key=lambda x: x[1], reverse=True)[:top_k]
+        # normalize BM25 scores using min-max to [0,1]
+        if top:
+            vals = [s for _, s in top]
+            mn, mx = min(vals), max(vals)
+            def norm(v):
+                return 0.0 if mx == mn else (v - mn) / (mx - mn + 1e-12)
+        else:
+            def norm(v):
+                return 0.0
+        return [(self.chunks[i].uid, float(norm(s))) for i, s in top]
+
+    def fetch_by_uids(self, uids: List[str]) -> List[Chunk]:
+        id2idx = {c.uid: i for i, c in enumerate(self.chunks)}
+        return [self.chunks[id2idx[u]] for u in uids if u in id2idx]
+
+# ---------------------- Text Preprocess ----------------------
+
+def simple_preprocess(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9$%.,:;\-/() ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# ---------------------- Memory-Augmented Retrieval ----------------------
+
+def load_memory(memory_file: Path) -> List[Dict[str, str]]:
+    if not memory_file.exists():
+        return []
+    items = []
+    with memory_file.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+                if "question" in obj and "answer" in obj:
+                    items.append(obj)
+            except Exception:
+                continue
+    return items
+
+
+def memory_search(query: str, memory: List[Dict[str, str]], encoder, top_k=3) -> List[Dict[str, str]]:
+    if not memory:
+        return []
+    qs = [m["question"] for m in memory]
+    q_emb = encoder.encode([query], normalize_embeddings=True)
+    m_emb = encoder.encode(qs, normalize_embeddings=True)
+    # cosine similarities
+    import numpy as np
+    sims = (q_emb @ m_emb.T).flatten().tolist()
+    idxs = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:top_k]
+    return [memory[i] for i in idxs]
+
+# ---------------------- Generation (GPT-2 small) ----------------------
+
+def get_generator():
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    model_name = "gpt2"
+    tok = AutoTokenizer.from_pretrained(model_name)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    return model, tok
+
+
+def build_prompt(query: str, contexts: List[str], memory_snippets: List[Dict[str, str]]) -> str:
+    header = (
+        "You are a helpful financial analyst. Answer strictly using the provided context.\n"
+        "If the answer is not present in the context, say 'I cannot find this in the provided reports.'\n"
+        "Cite exact figures and years.\n\n"
+    )
+    mem = ""
+    if memory_snippets:
+        mem_lines = [f"Q: {m['question']}\nA: {m['answer']}" for m in memory_snippets]
+        mem = "\n## Memory Q&A (may help)\n" + "\n\n".join(mem_lines) + "\n\n"
+    ctx = "\n\n".join([f"[CTX {i+1}]\n" + c for i, c in enumerate(contexts)])
+    prompt = f"{header}{mem}## Context\n{ctx}\n\n## Question\n{query}\n\n## Answer\n"
+    return prompt
+
+# ---------------------- Guardrails ----------------------
+
+def input_guard(query: str) -> Tuple[bool, str]:
+    banned = ["password", "social security", "credit card", "api key", "hacking", "exploit"]
+    if any(b in query.lower() for b in banned):
+        return False, "Query rejected by input guard: contains disallowed content."
+    if len(query.strip()) < 5:
+        return False, "Query too short; please ask a complete question."
+    return True, ""
+
+
+def groundedness_check(answer: str, contexts: List[str], encoder) -> float:
+    # cosine similarity between answer and concatenated context (proxy)
+    concat = "\n\n".join(contexts)
+    a = encoder.encode([answer], normalize_embeddings=True)
+    c = encoder.encode([concat], normalize_embeddings=True)
+    import numpy as np
+    sim = float((a @ c.T).flatten()[0])
+    # map from [-1,1] to [0,1]
+    return (sim + 1) / 2
+
+# ---------------------- RAG Pipeline ----------------------
+
+@dataclass
+class Answer:
+    text: str
+    confidence: float
+    method: str
+    response_ms: int
+
+
+def hybrid_retrieve(query: str, idx: Indexes, top_k=6, alpha=0.6, memory_qas: List[Dict[str, str]] = None, mem_top=2) -> Tuple[List[str], str, float]:
+    t0 = time.time()
+    # preprocess
+    q_clean = simple_preprocess(query)
+    dres = idx.dense_search(q_clean, top_k=top_k)
+    sres = idx.sparse_search(q_clean, top_k=top_k)
+    # fuse
+    score_map: Dict[str, float] = {}
+    for uid, sc in dres:
+        score_map[uid] = score_map.get(uid, 0.0) + alpha * max(sc, 0.0)
+    for uid, sc in sres:
+        score_map[uid] = score_map.get(uid, 0.0) + (1 - alpha) * sc
+    fused = sorted(score_map.items(), key=lambda x: x[1], reverse=True)[:top_k]
+    uids = [u for u, _ in fused]
+    chunks = idx.fetch_by_uids(uids)
+    # order by original score
+    texts = [c.text for c in chunks]
+
+    method = f"hybrid:dense+sparse:alpha={alpha:.2f}"
+
+    # memory augmentation
+    mem_snips = []
+    if memory_qas:
+        mem_snips = memory_search(query, memory_qas, idx.encoder, top_k=mem_top)
+        if mem_snips:
+            method += "+memory"
+
+    # confidence = normalized combined score of top result
+    top_score = fused[0][1] if fused else 0.0
+    conf = max(0.0, min(1.0, top_score))
+    return texts, method, conf
+
+
+def generate_answer(query: str, idx: Indexes, contexts: List[str], memory_qas: List[Dict[str, str]], max_ctx_tokens=900, max_new_tokens=160) -> Tuple[str, float]:
+    model, tok = get_generator()
+    # pack contexts within budget
+    # heuristic: include as many contexts as fit
+    selected = []
+    total = 0
+    for c in contexts:
+        n = len(tok(c)["input_ids"])  # approximate
+        if total + n <= max_ctx_tokens:
+            selected.append(c)
+            total += n
+        else:
+            break
+    prompt = build_prompt(query, selected, memory_qas)
+    inp = tok(prompt, return_tensors="pt")
+    out = model.generate(**inp, max_new_tokens=max_new_tokens, do_sample=True, top_p=0.9, temperature=0.7, eos_token_id=tok.eos_token_id)
+    ans = tok.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+    # groundedness
+    g = groundedness_check(ans, selected, idx.encoder)
+    return ans, g
+
+
+def answer_query(query: str, idx: Indexes, alpha=0.6, top_k=6, max_ctx_tokens=900, memory_file: Path = None) -> Answer:
+    ok, msg = input_guard(query)
+    if not ok:
+        return Answer(text=msg, confidence=0.0, method="guard:input_block", response_ms=0)
+
+    t0 = time.time()
+    memory_qas = load_memory(memory_file) if memory_file else []
+    ctxs, method, conf_retr = hybrid_retrieve(query, idx, top_k=top_k, alpha=alpha, memory_qas=memory_qas)
+    ans, grounded = generate_answer(query, idx, ctxs, memory_qas, max_ctx_tokens=max_ctx_tokens)
+
+    # output guardrail: if grounding too low, warn & include top snippet
+    warn = ""
+    if grounded < 0.45:
+        warn = "\n\n[Warning] Low groundedness detected; the answer may not be fully supported by the retrieved context."
+    ms = int((time.time() - t0) * 1000)
+    confidence = float(0.5 * conf_retr + 0.5 * grounded)
+    return Answer(text=ans + warn, confidence=confidence, method=method, response_ms=ms)
+
+# ---------------------- CLI ----------------------
+
+def build_cmd(args):
+    data_dir = Path(args.data_dir)
+    index_dir = Path(args.index_dir)
+    print(f"[Build] Loading documents from {data_dir} ...")
+    docs = load_documents(data_dir)
+    if not docs:
+        print("No documents loaded. Ensure your data directory has supported files.")
+        return
+    print(f"Loaded {len(docs)} documents. Building indexes...")
+    idx = Indexes(index_dir, embed_model_name=args.embed_model)
+    idx.build_from_texts(docs, chunk_sizes=(100, 400), overlap=20)
+    idx.save()
+    print(f"[Build] Saved indexes to {index_dir}")
+
+
+def chat_cmd(args):
+    index_dir = Path(args.index_dir)
+    idx = Indexes(index_dir, embed_model_name=args.embed_model)
+    idx.load()
+    print("[Chat] Index loaded. Type your question (or 'exit').")
+    mem_file = Path(args.memory_file) if args.memory_file else None
+    while True:
+        try:
+            q = input("\nQ> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print() ; break
+        if q.lower() in {"exit", "quit"}:
+            break
+        ans = answer_query(q, idx, alpha=args.alpha, top_k=args.top_k, max_ctx_tokens=args.max_ctx_tokens, memory_file=mem_file)
+        print(f"\nAnswer: {ans.text}\nConfidence: {ans.confidence:.2f}\nMethod: {ans.method}\nResponse time: {ans.response_ms} ms")
+
+
+def init_memory_cmd(args):
+    mem_path = Path(args.memory_file)
+    mem_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_qas = [
+        {"question": "What was the company’s revenue in 2023?", "answer": "The company’s revenue in 2023 was $4.13 billion."},
+        {"question": "What was the net income in 2024?", "answer": "Net income in 2024 was $0.52 billion as per the consolidated statement of operations."},
+        {"question": "How much cash and cash equivalents at year end 2024?", "answer": "Cash and cash equivalents totaled $1.2 billion at December 31, 2024."},
+        {"question": "What were total assets in 2023?", "answer": "Total assets were $9.7 billion in 2023 per the balance sheet."},
+        {"question": "What is the EPS (basic) for 2024?", "answer": "Basic EPS for 2024 was $1.05 per share."},
+    ]
+    with mem_path.open("w", encoding="utf-8") as f:
+        for qa in seed_qas:
+            f.write(json.dumps(qa, ensure_ascii=False) + "\n")
+    print(f"Initialized memory with {len(seed_qas)} Q/A to {mem_path}")
+
+
+# ---------------------- Main ----------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="RAG Financial QA (Hybrid + Memory, GPT-2)")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_build = sub.add_parser("build", help="Build indexes from documents")
+    p_build.add_argument("--data_dir", required=True)
+    p_build.add_argument("--index_dir", required=True)
+    p_build.add_argument("--embed_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    p_build.set_defaults(func=build_cmd)
+
+    p_chat = sub.add_parser("chat", help="Interactive chat over built index")
+    p_chat.add_argument("--index_dir", required=True)
+    p_chat.add_argument("--embed_model", default="sentence-transformers/all-MiniLM-L6-v2")
+    p_chat.add_argument("--alpha", type=float, default=0.6)
+    p_chat.add_argument("--top_k", type=int, default=6)
+    p_chat.add_argument("--max_ctx_tokens", type=int, default=900)
+    p_chat.add_argument("--memory_file", default="./memory.jsonl")
+    p_chat.set_defaults(func=chat_cmd)
+
+    p_mem = sub.add_parser("init-memory", help="Create a starter memory.jsonl with sample Q/A pairs")
+    p_mem.add_argument("--memory_file", default="./memory.jsonl")
+    p_mem.set_defaults(func=init_memory_cmd)
+
+    args = parser.parse_args()
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+# ---------------------- Requirements (pip) ----------------------
+# You can copy these into a requirements.txt
+# transformers==4.43.4
+# sentence-transformers==3.0.1
+# faiss-cpu==1.8.0
+# rank-bm25==0.2.2
+# pymupdf==1.24.9
+# beautifulsoup4==4.12.3
+# lxml==5.2.2
+# pandas==2.2.2
+# torch  # (install per your platform/CUDA)
+# numpy
+# """

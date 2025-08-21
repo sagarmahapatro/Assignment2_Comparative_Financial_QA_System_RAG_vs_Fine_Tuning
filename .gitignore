@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+env/
+converational_ai_env/
+conversational_ai_env/
+
+fine_tune_models/
+model_benchmark/
+
+data/index/
+data/processed/
